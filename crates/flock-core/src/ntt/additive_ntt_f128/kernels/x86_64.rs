@@ -77,6 +77,24 @@ unsafe fn mul_x4<const LOW: bool, const DIET: bool>(
     }
 }
 
+/// Dual-interleaved product across two 512-bit vector lanes.
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+unsafe fn mul_x4_pair<const LOW: bool, const DIET: bool>(
+    t: TwX4,
+    v0: core::arch::x86_64::__m512i,
+    v1: core::arch::x86_64::__m512i,
+) -> (core::arch::x86_64::__m512i, core::arch::x86_64::__m512i) {
+    use crate::field::gf2_128::x86_64::ghash_mul_x4_split_unroll2;
+    unsafe {
+        if DIET && !LOW {
+            ghash_mul_x4_split_unroll2(v0, v1, t.0, t.1)
+        } else {
+            (mul_x4::<LOW, DIET>(t, v0), mul_x4::<LOW, DIET>(t, v1))
+        }
+    }
+}
+
 /// Three-CLMUL product for a broadcast twiddle `t = a + x^64`.
 /// Writing `v = b + c*x^64` gives
 /// `t*v = a*b + x^64*(a*c + v)`, so the LOW product only needs one extra
@@ -1362,8 +1380,9 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
             let mut sd1 = _mm512_xor_si512(vd1, vb1);
             sb1 = _mm512_xor_si512(sb1, va1);
 
-            let new_sc0 = _mm512_xor_si512(sc0, mul_x4::<false, DIET>(sparse_b, sd0));
-            let new_sc1 = _mm512_xor_si512(sc1, mul_x4::<false, DIET>(sparse_b, sd1));
+            let (m_sc0, m_sc1) = mul_x4_pair::<false, DIET>(sparse_b, sd0, sd1);
+            let new_sc0 = _mm512_xor_si512(sc0, m_sc0);
+            let new_sc1 = _mm512_xor_si512(sc1, m_sc1);
             sd0 = _mm512_xor_si512(sd0, new_sc0);
             sd1 = _mm512_xor_si512(sd1, new_sc1);
             sc0 = new_sc0;
@@ -1379,29 +1398,33 @@ unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo_impl<
             store_sp(2, lane + 4, sc1);
             store_sp(3, lane + 4, sd1);
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<OUTER_LOW, DIET>(outer, vc0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<OUTER_LOW, DIET>(outer, vc1));
+            let (m_vc0, m_vc1) = mul_x4_pair::<OUTER_LOW, DIET>(outer, vc0, vc1);
+            let new_a0 = _mm512_xor_si512(va0, m_vc0);
+            let new_a1 = _mm512_xor_si512(va1, m_vc1);
             let vc0 = _mm512_xor_si512(vc0, new_a0);
             let vc1 = _mm512_xor_si512(vc1, new_a1);
             let va0 = new_a0;
             let va1 = new_a1;
 
-            let new_b0 = _mm512_xor_si512(vb0, mul_x4::<OUTER_LOW, DIET>(outer, vd0));
-            let new_b1 = _mm512_xor_si512(vb1, mul_x4::<OUTER_LOW, DIET>(outer, vd1));
+            let (m_vd0, m_vd1) = mul_x4_pair::<OUTER_LOW, DIET>(outer, vd0, vd1);
+            let new_b0 = _mm512_xor_si512(vb0, m_vd0);
+            let new_b1 = _mm512_xor_si512(vb1, m_vd1);
             let vd0 = _mm512_xor_si512(vd0, new_b0);
             let vd1 = _mm512_xor_si512(vd1, new_b1);
             let vb0 = new_b0;
             let vb1 = new_b1;
 
-            let new_a0 = _mm512_xor_si512(va0, mul_x4::<false, DIET>(inner_a, vb0));
-            let new_a1 = _mm512_xor_si512(va1, mul_x4::<false, DIET>(inner_a, vb1));
+            let (m_vb0, m_vb1) = mul_x4_pair::<false, DIET>(inner_a, vb0, vb1);
+            let new_a0 = _mm512_xor_si512(va0, m_vb0);
+            let new_a1 = _mm512_xor_si512(va1, m_vb1);
             let vb0 = _mm512_xor_si512(vb0, new_a0);
             let vb1 = _mm512_xor_si512(vb1, new_a1);
             let va0 = new_a0;
             let va1 = new_a1;
 
-            let new_c0 = _mm512_xor_si512(vc0, mul_x4::<false, DIET>(inner_b, vd0));
-            let new_c1 = _mm512_xor_si512(vc1, mul_x4::<false, DIET>(inner_b, vd1));
+            let (m_vd0, m_vd1) = mul_x4_pair::<false, DIET>(inner_b, vd0, vd1);
+            let new_c0 = _mm512_xor_si512(vc0, m_vd0);
+            let new_c1 = _mm512_xor_si512(vc1, m_vd1);
             let vd0 = _mm512_xor_si512(vd0, new_c0);
             let vd1 = _mm512_xor_si512(vd1, new_c1);
             let vc0 = new_c0;

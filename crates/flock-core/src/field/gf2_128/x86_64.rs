@@ -449,6 +449,46 @@ pub unsafe fn ghash_broadcast_split(t: F128) -> (__m512i, __m512i) {
     }
 }
 
+/// Two independent [`ghash_mul_x4_split`] products interleaved to dual-saturate
+/// execution ports (Port 0 & Port 5 VPCLMULQDQ).
+///
+/// # Safety
+/// Caller must ensure `avx512f` + `vpclmulqdq` are available.
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+#[inline]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+pub unsafe fn ghash_mul_x4_split_unroll2(
+    v0: __m512i,
+    v1: __m512i,
+    t: __m512i,
+    t_x64: __m512i,
+) -> (__m512i, __m512i) {
+    unsafe {
+        let lo0_a = _mm512_clmulepi64_epi128::<0x00>(v0, t);
+        let lo1_a = _mm512_clmulepi64_epi128::<0x00>(v1, t);
+        let lo0_b = _mm512_clmulepi64_epi128::<0x01>(v0, t_x64);
+        let lo1_b = _mm512_clmulepi64_epi128::<0x01>(v1, t_x64);
+        let lo0 = _mm512_xor_si512(lo0_a, lo0_b);
+        let lo1 = _mm512_xor_si512(lo1_a, lo1_b);
+
+        let hi0_a = _mm512_clmulepi64_epi128::<0x10>(v0, t);
+        let hi1_a = _mm512_clmulepi64_epi128::<0x10>(v1, t);
+        let hi0_b = _mm512_clmulepi64_epi128::<0x11>(v0, t_x64);
+        let hi1_b = _mm512_clmulepi64_epi128::<0x11>(v1, t_x64);
+        let hi0 = _mm512_xor_si512(hi0_a, hi0_b);
+        let hi1 = _mm512_xor_si512(hi1_a, hi1_b);
+
+        let poly = _mm512_set_epi64(0, 0x87, 0, 0x87, 0, 0x87, 0, 0x87);
+        let t0_red = _mm512_clmulepi64_epi128::<0x01>(hi0, poly);
+        let t1_red = _mm512_clmulepi64_epi128::<0x01>(hi1, poly);
+
+        (
+            _mm512_xor_si512(_mm512_xor_si512(lo0, _mm512_bslli_epi128::<8>(hi0)), t0_red),
+            _mm512_xor_si512(_mm512_xor_si512(lo1, _mm512_bslli_epi128::<8>(hi1)), t1_red),
+        )
+    }
+}
+
 /// Four independent [`ghash_mul_x4_split`] products by one split multiplier.
 ///
 /// # Safety
@@ -467,12 +507,9 @@ pub unsafe fn ghash_mul_x4_split_unroll4(
     // SAFETY: forwarded to four independent lane groups with the same valid
     // split multiplier.
     unsafe {
-        (
-            ghash_mul_x4_split(v0, t, t_x64),
-            ghash_mul_x4_split(v1, t, t_x64),
-            ghash_mul_x4_split(v2, t, t_x64),
-            ghash_mul_x4_split(v3, t, t_x64),
-        )
+        let (r0, r1) = ghash_mul_x4_split_unroll2(v0, v1, t, t_x64);
+        let (r2, r3) = ghash_mul_x4_split_unroll2(v2, v3, t, t_x64);
+        (r0, r1, r2, r3)
     }
 }
 
