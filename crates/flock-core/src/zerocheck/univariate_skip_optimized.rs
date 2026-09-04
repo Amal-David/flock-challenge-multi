@@ -1041,6 +1041,12 @@ pub struct Round1AbWindowPlan {
 }
 
 impl Round1AbWindowPlan {
+    /// Streaming store mode (0 = temporal, 1 = 32-byte NT, 2 = 64-byte NT).
+    #[inline]
+    pub fn nt(&self) -> u8 {
+        self.nt
+    }
+
     /// True when the caller has independently established the ranked BLAKE3
     /// static-B geometry and may use the checked-table complement leaf.
     #[inline]
